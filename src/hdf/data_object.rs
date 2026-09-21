@@ -23,6 +23,11 @@ pub const DATAOBJECT_MAX_DIMENSIONALITY: usize = 5;
 /// Data Layout Chunk alias
 pub(crate) type DataLayout = ArrayVec<u32, DATAOBJECT_MAX_DIMENSIONALITY>;
 
+/// Largest dataset read into memory, bytes. Room impulse response sets
+/// (`MultiSpeakerBRIR`) run to hundreds of MB; the bound only guards against
+/// a corrupt size, the reads themselves are bounded by the file.
+pub(crate) const MAX_DATASET_BYTES: u64 = 0x1_0000_0000;
+
 #[derive(Clone, Copy, Debug)]
 pub enum DataFormat {
     Fixed {

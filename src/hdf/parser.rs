@@ -16,6 +16,9 @@ pub(crate) struct State {
     end_of_file_address: u64,
     recursive_counter: u32,
     data_space: Option<DataSpace>,
+    /// Filter identifiers of the last filter pipeline message, in pipeline
+    /// order; empty when the object declared none.
+    filters: Vec<u16>,
 }
 
 impl State {
@@ -26,6 +29,7 @@ impl State {
             end_of_file_address: block.end_of_file_address,
             recursive_counter: 0,
             data_space: None,
+            filters: Vec::new(),
         }
     }
 
@@ -52,6 +56,14 @@ impl State {
 
     pub(crate) fn set_data_space(&mut self, data_space: DataSpace) {
         self.data_space = Some(data_space);
+    }
+
+    pub(crate) fn filters(&self) -> Vec<u16> {
+        self.filters.clone()
+    }
+
+    pub(crate) fn set_filters(&mut self, filters: Vec<u16>) {
+        self.filters = filters;
     }
 
     pub(crate) fn recursive_counter(&self) -> u32 {

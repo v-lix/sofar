@@ -16,6 +16,7 @@ use crate::hdf::gcol::gcol_read;
 
 use super::data_object::{
     AttributeInfo, DataFormat, DataObjectFlags, DataSpace, DataType, GroupInfo, LinkInfo,
+    MAX_DATASET_BYTES,
 };
 use super::helpers::varint_size;
 use super::parser::Input;
@@ -599,11 +600,11 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
         1 => {
             let data_address = varint_size(size_of_offsets).parse_next(input)?;
             let data_size = varint_size(size_of_lengths)
-                .verify(|sz| *sz < 0x1000_0000)
+                .verify(|sz| *sz <= MAX_DATASET_BYTES)
                 .context(StrContext::Label(
                     "Object OHDR message data layout, data size",
                 ))
-                .context(StrContext::Expected("< 0x10000000".into()))
+                .context(StrContext::Expected("<= 4 GiB".into()))
                 .parse_next(input)?;
 
             log::info!("CHUNK Contiguous SIZE: {data_size}");
@@ -654,16 +655,16 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
                 .fold(data_size, |acc, s| u64::saturating_mul(acc, *s))
                 as usize;
 
-            if data_size > 0x1000_0000 {
+            if data_size as u64 > MAX_DATASET_BYTES {
                 return Err(ErrMode::assert(
                     input,
                     "Object OHDR message data layout, data size too large",
                 ));
             }
 
-            // Note: The B-tree reader only supports data_space.dimensionality <= 3
-            // The layout dimensionality can be 4 (includes element size) even for 3D data
-            if input.state.is_address_valid(data_address) && data_space.dimensionality <= 3 {
+            // The layout dimensionality is the dataset's plus the element
+            // size dimension; the B-tree reader handles datasets up to rank 4.
+            if input.state.is_address_valid(data_address) {
                 // Use absolute seek to avoid underflow when data_address < cur_pos
                 let cp = input.checkpoint();
                 input.input.reset_to_start();
@@ -722,6 +723,7 @@ fn message_filter_pipeline(input: &mut Input) -> ModalResult<()> {
             .context(StrContext::Label("Filter identification value"))
             .parse_next(input)
     };
+    let mut ids: Vec<u16> = Vec::with_capacity(filters as usize);
 
     match version {
         1 => {
@@ -733,6 +735,7 @@ fn message_filter_pipeline(input: &mut Input) -> ModalResult<()> {
 
             for _ in 0..filters {
                 let filter_id_value = filter_id.parse_next(input)?;
+                ids.push(filter_id_value);
                 let name_len = le_u16.parse_next(input)?;
                 let _flags = le_u16.parse_next(input)?;
                 let values = le_u16.verify(|v| *v <= 0x1000).parse_next(input)?;
@@ -750,6 +753,7 @@ fn message_filter_pipeline(input: &mut Input) -> ModalResult<()> {
         2 => {
             for _ in 0..filters {
                 let filter_id_value = filter_id.parse_next(input)?;
+                ids.push(filter_id_value);
                 let _flags = le_u16.parse_next(input)?;
                 let values = le_u16.verify(|v| *v <= 0x1000).parse_next(input)?;
 
@@ -763,6 +767,7 @@ fn message_filter_pipeline(input: &mut Input) -> ModalResult<()> {
             unreachable!();
         }
     }
+    input.state.set_filters(ids);
 
     Ok(())
 }
