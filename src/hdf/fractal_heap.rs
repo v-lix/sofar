@@ -1,5 +1,5 @@
 use winnow::binary::{le_u8, le_u16, le_u32, le_u64};
-use winnow::error::{ErrMode, ParserError, StrContext};
+use winnow::error::StrContext;
 use winnow::stream::Stream;
 use winnow::token::{literal, take};
 use winnow::{ModalResult, Parser};
@@ -122,11 +122,17 @@ pub(crate) fn fractal_heap_read(input: &mut Input) -> ModalResult<(FractalHeap, 
 
     // Validate constraints from C code
     if number_huge_objects > 0 {
-        return Err(ErrMode::assert(input, "Cannot handle huge objects"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "Cannot handle huge objects",
+        ));
     }
 
     if number_tiny_objects > 0 {
-        return Err(ErrMode::assert(input, "Cannot handle tiny objects"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "Cannot handle tiny objects",
+        ));
     }
 
     let fractal_heap = FractalHeap {
@@ -196,7 +202,10 @@ fn direct_block_read(
     let size_of_offsets = input.state.size_of_offsets();
 
     if input.state.recursive_counter() >= MAX_RECURSIVE_DEPTH {
-        return Err(ErrMode::assert(input, "Recursive problem in fractal heap"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "Recursive problem in fractal heap",
+        ));
     }
 
     input.state.recursive_counter_inc();
@@ -241,7 +250,7 @@ fn direct_block_read(
         let length = varint_size(length_size).parse_next(input)?;
 
         if length > 0x10000000 {
-            return Err(ErrMode::assert(input, "FHDB length too large"));
+            return Err(crate::hdf::helpers::invalid(input, "FHDB length too large"));
         }
 
         match type_and_version {
@@ -310,7 +319,10 @@ fn parse_type_3_attribute(input: &mut Input, length: usize) -> ModalResult<Attri
         0x20000020000 => Some(String::new()),
         _ => {
             log::warn!("Unsupported FHDB type 3 value format: {unknown1:#x}");
-            return Err(ErrMode::assert(input, "Unsupported FHDB type 3 format"));
+            return Err(crate::hdf::helpers::invalid(
+                input,
+                "Unsupported FHDB type 3 format",
+            ));
         }
     };
 
@@ -358,7 +370,10 @@ fn parse_type_1_entry(input: &mut Input, _length: usize) -> ModalResult<FractalH
         }
         _ => {
             log::warn!("FHDB type 1 unsupported values {unknown2:#08x}");
-            return Err(ErrMode::assert(input, "Unsupported FHDB type 1 format"));
+            return Err(crate::hdf::helpers::invalid(
+                input,
+                "Unsupported FHDB type 1 format",
+            ));
         }
     }
 
@@ -415,7 +430,7 @@ fn parse_complex_attribute(input: &mut Input) -> ModalResult<Attribute> {
         0x02000002 => None, // No value
         _ => {
             log::warn!("Unknown complex attribute format: {unknown4:#x}");
-            return Err(ErrMode::assert(
+            return Err(crate::hdf::helpers::invalid(
                 input,
                 "Unsupported complex attribute format",
             ));
@@ -440,7 +455,10 @@ fn indirect_block_read(
     let size_of_lengths = input.state.size_of_lengths();
 
     if input.state.recursive_counter() >= MAX_RECURSIVE_DEPTH {
-        return Err(ErrMode::assert(input, "Recursive problem in fractal heap"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "Recursive problem in fractal heap",
+        ));
     }
 
     input.state.recursive_counter_inc();
@@ -460,7 +478,10 @@ fn indirect_block_read(
     let block_offset = varint_size(size as u8).parse_next(input)?;
 
     if block_offset != 0 {
-        return Err(ErrMode::assert(input, "FHIB block offset is not 0"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "FHIB block offset is not 0",
+        ));
     }
 
     // Calculate nrows and max_dblock_rows using log2

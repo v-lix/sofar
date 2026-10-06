@@ -9,7 +9,7 @@ use winnow::ModalResult;
 use winnow::Parser;
 use winnow::binary::{le_u8, le_u16, le_u32, le_u64};
 use winnow::combinator::repeat;
-use winnow::error::{ErrMode, ParserError, StrContext};
+use winnow::error::StrContext;
 use winnow::stream::Stream;
 use winnow::token::{literal, take};
 
@@ -62,14 +62,17 @@ pub(crate) fn tree(
 ) -> impl FnMut(&mut Input) -> ModalResult<Vec<u8>> {
     move |input| {
         if data_len as u64 > MAX_DATASET_BYTES {
-            return Err(ErrMode::assert(
+            return Err(crate::hdf::helpers::invalid(
                 input,
                 "Tree data_len exceeds maximum allowed size",
             ));
         }
         let dims = data_space.dimensionality as usize;
         if dims == 0 || dims > data_space.dimension_size.len() || dims >= data_layout.len() {
-            return Err(ErrMode::assert(input, "Tree dimensionality unsupported"));
+            return Err(crate::hdf::helpers::invalid(
+                input,
+                "Tree dimensionality unsupported",
+            ));
         }
         let chunk: Vec<u64> = data_layout[..dims].iter().map(|&c| c as u64).collect();
         let size = data_layout[dims] as u64;
@@ -84,7 +87,10 @@ pub(crate) fn tree(
                 .checked_mul(size)
                 .is_none_or(|b| b > MAX_CHUNK_BYTES)
         {
-            return Err(ErrMode::assert(input, "Invalid tree elements or size"));
+            return Err(crate::hdf::helpers::invalid(
+                input,
+                "Invalid tree elements or size",
+            ));
         }
         let dataset: Vec<u64> = data_space.dimension_size[..dims].to_vec();
         let mut stride = vec![1u64; dims];
@@ -124,7 +130,10 @@ fn read_node(
     depth: u8,
 ) -> ModalResult<()> {
     if depth > MAX_TREE_DEPTH {
-        return Err(ErrMode::assert(input, "Tree deeper than supported"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "Tree deeper than supported",
+        ));
     }
     let size_of_offsets = input.state.size_of_offsets();
 
@@ -158,7 +167,10 @@ fn read_node(
         let _element_offset = le_u64.parse_next(input)?;
         let child = varint_size(size_of_offsets).parse_next(input)?;
         if !input.state.is_address_valid(child) {
-            return Err(ErrMode::assert(input, "Invalid child pointer address"));
+            return Err(crate::hdf::helpers::invalid(
+                input,
+                "Invalid child pointer address",
+            ));
         }
         let _ = filter_mask;
 
@@ -193,13 +205,16 @@ fn read_chunk(
     let inflated;
     let buf: &[u8] = if g.deflate {
         inflated = decompress_to_vec_zlib_with_limit(raw, olen)
-            .map_err(|_err| ErrMode::assert(input, "Failed to inflate btree data"))?;
+            .map_err(|_err| crate::hdf::helpers::invalid(input, "Failed to inflate btree data"))?;
         &inflated
     } else {
         raw
     };
     if buf.len() != olen {
-        return Err(ErrMode::assert(input, "Invalid tree chunk length"));
+        return Err(crate::hdf::helpers::invalid(
+            input,
+            "Invalid tree chunk length",
+        ));
     }
 
     let last = g.dims - 1;

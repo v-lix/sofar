@@ -1,7 +1,6 @@
-use winnow::error::ParserError;
+use winnow::prelude::*;
 use winnow::stream::{LocatingSlice, Location, Stateful, Stream};
 use winnow::token::take;
-use winnow::{error::ErrMode, prelude::*};
 
 use super::data_object::{DataObject, DataSpace, data_object};
 use super::super_block::{SuperBlock, super_block};
@@ -93,7 +92,10 @@ impl<'a> ParsedHdf<'a> {
     /// Use addresses from `root.child_directories` to navigate the tree.
     pub fn parse_child(&self, name: &str, address: u64) -> ModalResult<DataObject> {
         if !self.state.is_address_valid(address) {
-            return Err(ErrMode::assert(&self.data, "Invalid child object address"));
+            return Err(crate::hdf::helpers::invalid(
+                &self.data,
+                "Invalid child object address",
+            ));
         }
 
         let input = LocatingSlice::new(self.data);
@@ -125,7 +127,7 @@ pub fn parse_with_children(input: &[u8]) -> ModalResult<ParsedHdf<'_>> {
     slice.reset(&cp);
 
     if super_block.end_of_file_address as usize != slice.eof_offset() {
-        return Err(ErrMode::assert(&slice, "File size mismatch"));
+        return Err(crate::hdf::helpers::invalid(&slice, "File size mismatch"));
     }
 
     let state = State::new(&super_block);
@@ -159,7 +161,7 @@ pub fn parse(mut input: &[u8]) -> ModalResult<DataObject> {
             super_block.end_of_file_address,
             input.eof_offset()
         );
-        return Err(ErrMode::assert(&input, "File size mismatch"));
+        return Err(crate::hdf::helpers::invalid(&input, "File size mismatch"));
     }
 
     log::debug!(

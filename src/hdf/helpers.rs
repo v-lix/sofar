@@ -26,6 +26,24 @@ where
     }
 }
 
+/// A malformed file: an error carrying `message`, in every build.
+///
+/// `ErrMode::assert` is meant for parser bugs, not bad input: it panics when
+/// `debug_assertions` are on, so a corrupt file crashed debug builds of every
+/// application reading it. This is the error `assert` returns in release,
+/// with the message kept as context.
+pub(crate) fn invalid<I: Stream>(
+    input: &I,
+    message: &'static str,
+) -> winnow::error::ErrMode<winnow::error::ContextError> {
+    use winnow::error::{AddContext, ContextError, ErrMode, StrContext};
+    ErrMode::Backtrack(ContextError::new().add_context(
+        input,
+        &input.checkpoint(),
+        StrContext::Label(message),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

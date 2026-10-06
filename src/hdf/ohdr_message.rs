@@ -3,7 +3,7 @@ use winnow::combinator::{cond, cut_err, repeat};
 use winnow::stream::{Location, Offset, Stream};
 use winnow::token::{take, take_till};
 
-use winnow::error::{ErrMode, ParserError, StrContext};
+use winnow::error::{ErrMode, StrContext};
 use winnow::{ModalResult, Parser};
 
 use arrayvec::ArrayVec;
@@ -270,7 +270,7 @@ fn message_data_space(input: &mut Input) -> ModalResult<DataSpace> {
     let flags = le_u8.parse_next(input)?; // Remove the verify from here
 
     if version == 1 && flags & 2 != 0 {
-        return Err(ErrMode::assert(
+        return Err(crate::hdf::helpers::invalid(
             input,
             "Permutation in OHDR is not supported",
         ));
@@ -483,7 +483,7 @@ fn message_data_type(input: &mut Input) -> ModalResult<DataType> {
                     }
                 }
                 _t => {
-                    return Err(ErrMode::assert(
+                    return Err(crate::hdf::helpers::invalid(
                         input,
                         "object OHDR compound datatype message must have version 1 or 3",
                     ));
@@ -497,7 +497,7 @@ fn message_data_type(input: &mut Input) -> ModalResult<DataType> {
         // list
         9 => None,
         _t => {
-            return Err(ErrMode::assert(
+            return Err(crate::hdf::helpers::invalid(
                 input,
                 "object OHDR datatype message has unknown variable type",
             ));
@@ -644,7 +644,10 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
 
             let data_size = data_layout_chunk.last().copied().unwrap() as u64;
             let Some(data_space) = input.state.data_space() else {
-                return Err(ErrMode::assert(input, "Data space is not available"));
+                return Err(crate::hdf::helpers::invalid(
+                    input,
+                    "Data space is not available",
+                ));
             };
 
             // SAFETY, we check if dimensionality is non zero, so here we can
@@ -656,7 +659,7 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
                 as usize;
 
             if data_size as u64 > MAX_DATASET_BYTES {
-                return Err(ErrMode::assert(
+                return Err(crate::hdf::helpers::invalid(
                     input,
                     "Object OHDR message data layout, data size too large",
                 ));
@@ -981,7 +984,7 @@ fn message_continue(
         log::info!(" continue {offset:#x} {length:#x}");
 
         if input.state.recursive_counter() >= MAX_CONTINUATION_DEPTH {
-            return Err(ErrMode::assert(input, "Recursive problem"));
+            return Err(crate::hdf::helpers::invalid(input, "Recursive problem"));
         }
 
         let cp = input.checkpoint();
