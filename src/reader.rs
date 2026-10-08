@@ -37,9 +37,23 @@
 //! let data = std::fs::read("path/to/file.sofa").unwrap();
 //! let sofa = Sofar::open_data(&data).unwrap();
 //! ```
+//!
+//! Read a few measurements of a large file without the rest:
+//!
+//! ```no_run
+//! use sofar::reader::LazySofa;
+//!
+//! let data = std::fs::read("path/to/room.sofa").unwrap();
+//! let sofa = LazySofa::open(&data).unwrap();
+//! let views = &sofa.hrtf().listener_view.values;
+//! let first = sofa.read_ir(0, 1).unwrap();
+//! ```
 
 use std::path::Path;
 
+use winnow::error::{ContextError, ErrMode};
+
+use crate::hdf::{self, DataObject, ParsedHdf};
 use crate::sofa::{
     Hrtf, InterpolatedFilter, Lookup, Neighborhood, get_filter_nointerp, interpolate, normalize,
     resample, validate,
@@ -358,4 +372,81 @@ impl Sofar {
     pub fn num_measurements(&self) -> u32 {
         self.hrtf.m()
     }
+}
+
+/// A SOFA file held in memory, opened without reading its impulse
+/// responses.
+///
+/// Every other variable is read and converted to cartesian coordinates as
+/// [`OpenOptions::open_data`] does; nothing is resampled or normalised, and
+/// no lookup is built. `Data.IR` stays in the file until
+/// [`LazySofa::read_ir`] reads the measurements a caller picks, unfiltering
+/// only the stored chunks that hold them: one head orientation of a room
+/// response set that runs to hundreds of MB, read in a fraction of the time
+/// and memory the whole set takes.
+pub struct LazySofa<'a> {
+    parsed: ParsedHdf<'a>,
+    ir: DataObject,
+    hrtf: Hrtf,
+}
+
+impl<'a> LazySofa<'a> {
+    /// Open the SOFA file in `bytes`, reading everything but `Data.IR`'s
+    /// elements.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not a SOFA file, or it has no `Data.IR`.
+    pub fn open(bytes: &'a [u8]) -> Result<Self, Error> {
+        let parsed = hdf::parse_with_children(bytes).map_err(crate::sofa::Error::from)?;
+        let mut hrtf = Hrtf::from_parsed_hdf(&parsed, false)?;
+        hrtf.convert_to_cartesian();
+        let ir = parsed
+            .get_child_header("Data.IR")
+            .ok_or(crate::sofa::Error::MissingArray("Data.IR"))?
+            .map_err(hdf_error)?;
+        Ok(Self { parsed, ir, hrtf })
+    }
+
+    /// The file's variables but `Data.IR`, whose values are left empty.
+    pub fn hrtf(&self) -> &Hrtf {
+        &self.hrtf
+    }
+
+    /// The shape of `Data.IR` as stored, outermost first: `[M, R, N]`, or
+    /// `[M, R, E, N]` where a convention measures several emitters at once
+    /// (`MultiSpeakerBRIR`).
+    pub fn ir_shape(&self) -> Vec<usize> {
+        let ds = &self.ir.ds;
+        ds.dimension_size
+            .iter()
+            .take(ds.dimensionality as usize)
+            .map(|&d| d as usize)
+            .collect()
+    }
+
+    /// Measurements `first..first + count` of `Data.IR`: every value of
+    /// each, row-major, as `f32`.
+    ///
+    /// # Errors
+    ///
+    /// The measurements lie beyond the file's, or their storage is damaged
+    /// or of a type that is not a number.
+    pub fn read_ir(&self, first: usize, count: usize) -> Result<Vec<f32>, Error> {
+        let bytes = self
+            .parsed
+            .read_rows(&self.ir, first as u64, count as u64)
+            .map_err(hdf_error)?;
+        Hrtf::convert_data_to_f32(&bytes, &self.ir.dt)
+            .ok_or(Error::Parse(crate::sofa::Error::UnsupportedDataType))
+    }
+}
+
+/// An HDF parse error as this module reports it.
+fn hdf_error(e: ErrMode<ContextError>) -> Error {
+    let e = match e {
+        ErrMode::Backtrack(e) | ErrMode::Cut(e) => e,
+        ErrMode::Incomplete(_) => ContextError::new(),
+    };
+    Error::Parse(crate::sofa::Error::from(e))
 }

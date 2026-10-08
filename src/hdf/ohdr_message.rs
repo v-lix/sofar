@@ -10,7 +10,7 @@ use arrayvec::ArrayVec;
 use bitflags::bitflags;
 
 use crate::hdf::btree::tree;
-use crate::hdf::data_object::DataLayout;
+use crate::hdf::data_object::{DataLayout, Storage};
 use crate::hdf::fractal_heap::Attribute;
 use crate::hdf::gcol::gcol_read;
 
@@ -46,11 +46,16 @@ pub(crate) enum HeaderMessageKind {
     DataType(DataType),
     DataFillOld,
     DataFill,
-    DataLayout(Vec<u8>),
+    /// The dataset's elements (empty when they were not read) and where
+    /// they are stored.
+    DataLayout(Vec<u8>, Option<Storage>),
     GroupInfo(GroupInfo),
     FilterPipeline,
     Attribute(Option<Attribute>),
-    Continue { offset: u64, length: u64 },
+    Continue {
+        offset: u64,
+        length: u64,
+    },
     AttributeInfo(AttributeInfo),
 }
 
@@ -198,8 +203,8 @@ fn message_kind(
                 HeaderMessageKind::DataFill
             }
             8 => {
-                let data = message_data_layout.parse_next(input)?;
-                HeaderMessageKind::DataLayout(data)
+                let (data, storage) = message_data_layout.parse_next(input)?;
+                HeaderMessageKind::DataLayout(data, storage)
             }
             10 => {
                 let gi = message_group_info.parse_next(input)?;
@@ -573,9 +578,13 @@ fn message_data_fill(input: &mut Input) -> ModalResult<()> {
     Ok(())
 }
 
-fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
+/// The data layout message: where the dataset's elements are stored, and
+/// the elements themselves unless the object is parsed for its header only
+/// (`State::read_data`).
+fn message_data_layout(input: &mut Input) -> ModalResult<(Vec<u8>, Option<Storage>)> {
     let size_of_offsets = input.state.size_of_offsets();
     let size_of_lengths = input.state.size_of_lengths();
+    let read_data = input.state.read_data();
 
     let _version = le_u8
         .verify(|v| *v == 3)
@@ -595,7 +604,7 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
             let _skip = take(data_size).parse_next(input)?;
 
             log::info!("TODO layout 0, size: {data_size}");
-            vec![]
+            (vec![], None)
         }
         1 => {
             let data_address = varint_size(size_of_offsets).parse_next(input)?;
@@ -609,17 +618,25 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
 
             log::info!("CHUNK Contiguous SIZE: {data_size}");
 
-            if input.state.is_address_valid(data_address) {
-                // Use absolute seek to avoid underflow when data_address < cur_pos
-                let cp = input.checkpoint();
-                input.input.reset_to_start();
-                let _skip = take(data_address as usize).parse_next(input)?;
-                let data = take(data_size as usize).parse_next(input)?;
-
-                input.reset(&cp);
-                data.to_vec()
+            if !input.state.is_address_valid(data_address) {
+                (vec![], None)
             } else {
-                vec![]
+                let storage = Storage::Contiguous {
+                    address: data_address,
+                    size: data_size,
+                };
+                if !read_data {
+                    (vec![], Some(storage))
+                } else {
+                    // Use absolute seek to avoid underflow when data_address < cur_pos
+                    let cp = input.checkpoint();
+                    input.input.reset_to_start();
+                    let _skip = take(data_address as usize).parse_next(input)?;
+                    let data = take(data_size as usize).parse_next(input)?;
+
+                    input.reset(&cp);
+                    (data.to_vec(), Some(storage))
+                }
             }
         }
         2 => {
@@ -667,17 +684,38 @@ fn message_data_layout(input: &mut Input) -> ModalResult<Vec<u8>> {
 
             // The layout dimensionality is the dataset's plus the element
             // size dimension; the B-tree reader handles datasets up to rank 4.
-            if input.state.is_address_valid(data_address) {
-                // Use absolute seek to avoid underflow when data_address < cur_pos
-                let cp = input.checkpoint();
-                input.input.reset_to_start();
-                let _skip = take(data_address as usize).parse_next(input)?;
-                let data = tree(data_size, data_space, data_layout_chunk).parse_next(input)?;
-
-                input.reset(&cp);
-                data
+            if !input.state.is_address_valid(data_address) {
+                (vec![], None)
             } else {
-                vec![]
+                // The pipeline message precedes the layout message in files
+                // written by the HDF5 library; a dataset without one holds
+                // raw chunks.
+                let storage = Storage::Chunked {
+                    address: data_address,
+                    layout: data_layout_chunk.clone(),
+                    space: data_space.clone(),
+                    filters: input.state.filters(),
+                };
+                if !read_data {
+                    (vec![], Some(storage))
+                } else {
+                    let rows = data_space.dimension_size.first().copied().unwrap_or(0);
+                    // Use absolute seek to avoid underflow when data_address < cur_pos
+                    let cp = input.checkpoint();
+                    input.input.reset_to_start();
+                    let _skip = take(data_address as usize).parse_next(input)?;
+                    let data = tree(
+                        data_space,
+                        data_layout_chunk,
+                        input.state.filters(),
+                        0,
+                        rows,
+                    )
+                    .parse_next(input)?;
+
+                    input.reset(&cp);
+                    (data, Some(storage))
+                }
             }
         }
         _ => {
