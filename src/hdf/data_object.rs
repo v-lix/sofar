@@ -118,6 +118,23 @@ pub struct BinaryTree {
     pub records: Vec<Record>,
 }
 
+/// Where a dataset's elements are stored, kept so that part of them can be
+/// read later ([`super::ParsedHdf::read_rows`]).
+#[derive(Clone, Debug)]
+pub(crate) enum Storage {
+    /// One run of `size` bytes at `address`, row-major.
+    Contiguous { address: u64, size: u64 },
+    /// Chunks indexed by the version 1 B-tree at `address`: `layout` holds
+    /// the chunk extent per dimension, then the element size; `filters` the
+    /// pipeline each chunk went through.
+    Chunked {
+        address: u64,
+        layout: DataLayout,
+        space: DataSpace,
+        filters: Vec<u16>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct DataObject {
     pub name: String,
@@ -138,6 +155,10 @@ pub struct DataObject {
     pub data: Vec<u8>,
     pub parsed_attributes: Vec<Attribute>,
     pub child_directories: Vec<DirectoryEntry>,
+
+    /// Where `data` came from, or would have: read or not, a dataset's
+    /// storage is kept.
+    pub(crate) storage: Option<Storage>,
 }
 
 bitflags! {
@@ -178,6 +199,7 @@ fn build_data_object_from_messages(
         data: Vec::new(),
         parsed_attributes: Vec::new(),
         child_directories: Vec::new(),
+        storage: None,
     };
 
     for message in messages {
@@ -186,7 +208,10 @@ fn build_data_object_from_messages(
             HeaderMessageKind::LinkInfo(li) => data_object.li = li,
             HeaderMessageKind::DataType(dt) => data_object.dt = dt,
             HeaderMessageKind::AttributeInfo(ai) => data_object.ai = ai,
-            HeaderMessageKind::DataLayout(data) => data_object.data = data,
+            HeaderMessageKind::DataLayout(data, storage) => {
+                data_object.data = data;
+                data_object.storage = storage;
+            }
             HeaderMessageKind::GroupInfo(gi) => data_object.gi = gi,
             HeaderMessageKind::Attribute(Some(attr)) => {
                 data_object.parsed_attributes.push(attr);

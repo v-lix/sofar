@@ -2,7 +2,8 @@ use winnow::prelude::*;
 use winnow::stream::{LocatingSlice, Location, Stateful, Stream};
 use winnow::token::take;
 
-use super::data_object::{DataObject, DataSpace, data_object};
+use super::btree::tree;
+use super::data_object::{DataObject, DataSpace, MAX_DATASET_BYTES, Storage, data_object};
 use super::super_block::{SuperBlock, super_block};
 
 pub(crate) type Input<'a> = Stateful<LocatingSlice<&'a [u8]>, State>;
@@ -18,6 +19,8 @@ pub(crate) struct State {
     /// Filter identifiers of the last filter pipeline message, in pipeline
     /// order; empty when the object declared none.
     filters: Vec<u16>,
+    /// Whether a dataset's elements are read along with its header.
+    read_data: bool,
 }
 
 impl State {
@@ -29,7 +32,12 @@ impl State {
             recursive_counter: 0,
             data_space: None,
             filters: Vec::new(),
+            read_data: true,
         }
+    }
+
+    pub(crate) fn read_data(&self) -> bool {
+        self.read_data
     }
 
     pub fn size_of_lengths(&self) -> u8 {
@@ -91,21 +99,7 @@ impl<'a> ParsedHdf<'a> {
     ///
     /// Use addresses from `root.child_directories` to navigate the tree.
     pub fn parse_child(&self, name: &str, address: u64) -> ModalResult<DataObject> {
-        if !self.state.is_address_valid(address) {
-            return Err(crate::hdf::helpers::invalid(
-                &self.data,
-                "Invalid child object address",
-            ));
-        }
-
-        let input = LocatingSlice::new(self.data);
-        let mut stream = Input {
-            input,
-            state: self.state.clone(),
-        };
-
-        let _skip = take(address as usize).parse_next(&mut stream)?;
-        data_object(name).parse_next(&mut stream)
+        self.parse_object(name, address, true)
     }
 
     /// Find a child by name and parse it.
@@ -115,6 +109,99 @@ impl<'a> ParsedHdf<'a> {
             .iter()
             .find(|d| d.name == name)
             .map(|d| self.parse_child(&d.name, d.address))
+    }
+
+    /// Find a child by name and parse its header only: shape, type and
+    /// attributes as [`Self::get_child`] parses them, `data` left empty.
+    /// [`Self::read_rows`] then reads the part of the elements a caller
+    /// needs, so a dataset of hundreds of MB costs nothing until then.
+    pub fn get_child_header(&self, name: &str) -> Option<ModalResult<DataObject>> {
+        self.root
+            .child_directories
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| self.parse_object(&d.name, d.address, false))
+    }
+
+    /// Rows `first..first + count` of the first dimension of `object`, a
+    /// dataset of this file parsed by [`Self::get_child_header`] or
+    /// [`Self::get_child`]: the elements as stored, row-major, in the
+    /// file's element size. Only the storage holding those rows is read; a
+    /// chunked dataset's other chunks are neither read nor unfiltered.
+    ///
+    /// # Errors
+    ///
+    /// The rows lie beyond the dataset, the dataset has no storage to read
+    /// (no data written, or a compact layout), or the storage is damaged.
+    pub fn read_rows(&self, object: &DataObject, first: u64, count: u64) -> ModalResult<Vec<u8>> {
+        let mut stream = Input {
+            input: LocatingSlice::new(self.data),
+            state: self.state.clone(),
+        };
+        let invalid = |stream: &Input, why| Err(crate::hdf::helpers::invalid(stream, why));
+        let dims = object.ds.dimensionality as usize;
+        if dims == 0 || dims > object.ds.dimension_size.len() {
+            return invalid(&stream, "read_rows: not an array");
+        }
+        let rows = object.ds.dimension_size[0];
+        if first.checked_add(count).is_none_or(|hi| hi > rows) {
+            return invalid(&stream, "read_rows: rows beyond the dataset");
+        }
+        match &object.storage {
+            None => invalid(&stream, "read_rows: no storage to read"),
+            Some(Storage::Contiguous { address, size }) => {
+                // Elements per row, and the element size the type declares.
+                let row = object.ds.dimension_size[1..dims]
+                    .iter()
+                    .try_fold(u64::from(object.dt.size), |acc, &d| acc.checked_mul(d));
+                let span = row.and_then(|row| {
+                    let all = row.checked_mul(rows)?;
+                    let at = address.checked_add(first.checked_mul(row)?)?;
+                    let len = count.checked_mul(row)?;
+                    if all > *size || len > MAX_DATASET_BYTES {
+                        return None;
+                    }
+                    Some((usize::try_from(at).ok()?, usize::try_from(len).ok()?))
+                });
+                let Some((at, len)) = span else {
+                    return invalid(&stream, "read_rows: contiguous size mismatch");
+                };
+                let _skip = take(at).parse_next(&mut stream)?;
+                let bytes = take(len).parse_next(&mut stream)?;
+                Ok(bytes.to_vec())
+            }
+            Some(Storage::Chunked {
+                address,
+                layout,
+                space,
+                filters,
+            }) => {
+                let Ok(at) = usize::try_from(*address) else {
+                    return invalid(&stream, "read_rows: chunk index beyond the file");
+                };
+                let _skip = take(at).parse_next(&mut stream)?;
+                tree(space.clone(), layout.clone(), filters.clone(), first, count)
+                    .parse_next(&mut stream)
+            }
+        }
+    }
+
+    /// Parse the object at `address`, with or without its data.
+    fn parse_object(&self, name: &str, address: u64, read_data: bool) -> ModalResult<DataObject> {
+        if !self.state.is_address_valid(address) {
+            return Err(crate::hdf::helpers::invalid(
+                &self.data,
+                "Invalid child object address",
+            ));
+        }
+
+        let input = LocatingSlice::new(self.data);
+        let mut state = self.state.clone();
+        state.read_data = read_data;
+        let mut stream = Input { input, state };
+
+        let _skip = take(address as usize).parse_next(&mut stream)?;
+        data_object(name).parse_next(&mut stream)
     }
 }
 

@@ -61,11 +61,12 @@ impl Hrtf {
     /// Returns an error if the data is not a valid SOFA file.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let parsed = hdf::parse_with_children(data)?;
-        Self::from_parsed_hdf(&parsed)
+        Self::from_parsed_hdf(&parsed, true)
     }
 
-    /// Build HRTF from a parsed HDF5 file.
-    fn from_parsed_hdf(parsed: &ParsedHdf<'_>) -> Result<Self> {
+    /// Build HRTF from a parsed HDF5 file; without `Data.IR`'s elements
+    /// unless `read_ir`.
+    pub(crate) fn from_parsed_hdf(parsed: &ParsedHdf<'_>, read_ir: bool) -> Result<Self> {
         let root = &parsed.root;
 
         // Check for SOFA convention attribute
@@ -97,7 +98,11 @@ impl Hrtf {
         let emitter_position = Self::parse_array(parsed, "EmitterPosition").unwrap_or_default();
         let listener_up = Self::parse_array(parsed, "ListenerUp").unwrap_or_default();
         let listener_view = Self::parse_array(parsed, "ListenerView").unwrap_or_default();
-        let data_ir = Self::parse_array(parsed, "Data.IR").unwrap_or_default();
+        let data_ir = if read_ir {
+            Self::parse_array(parsed, "Data.IR").unwrap_or_default()
+        } else {
+            Array::default()
+        };
         let data_sampling_rate = Self::parse_array(parsed, "Data.SamplingRate").unwrap_or_default();
         let data_delay = Self::parse_array(parsed, "Data.Delay").unwrap_or_default();
 
@@ -169,8 +174,9 @@ impl Hrtf {
         dims.m = 1;
 
         // Try parsing Data.IR to get M, R, N (shape is M × R × N)
-        // Use a Result to handle parse failures gracefully
-        let ir_result = parsed.get_child("Data.IR");
+        // Use a Result to handle parse failures gracefully. Its header
+        // holds the shape: the elements are read with the other arrays.
+        let ir_result = parsed.get_child_header("Data.IR");
         if let Some(Ok(ir_obj)) = ir_result
             && ir_obj.ds.dimensionality >= 3
         {
@@ -260,7 +266,7 @@ impl Hrtf {
     }
 
     /// Convert raw bytes to f32 values based on data type.
-    fn convert_data_to_f32(data: &[u8], dt: &DataType) -> Option<Vec<f32>> {
+    pub(crate) fn convert_data_to_f32(data: &[u8], dt: &DataType) -> Option<Vec<f32>> {
         let class = dt.class_and_version & 0x0F;
 
         match class {

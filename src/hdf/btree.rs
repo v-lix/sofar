@@ -45,28 +45,48 @@ struct Geometry {
     /// Whether the pipeline holds the deflate / shuffle filters.
     deflate: bool,
     shuffle: bool,
+    /// The rows of the first dimension read, `lo..hi`; every other
+    /// dimension is read whole.
+    lo: u64,
+    hi: u64,
 }
 
-/// Read a chunked dataset through its version 1 B-tree (node type 1),
-/// scattering every chunk into a row-major buffer of `data_len` bytes.
+impl Geometry {
+    /// Elements of dimension `d` read: `lo..hi` of the first, all of the
+    /// others.
+    fn window(&self, d: usize) -> (u64, u64) {
+        if d == 0 {
+            (self.lo, self.hi)
+        } else {
+            (0, self.dataset[d])
+        }
+    }
+
+    /// Whether the chunk at `start` holds any of the rows read.
+    fn holds_rows(&self, start: &[u64]) -> bool {
+        start[0] < self.hi && start[0].saturating_add(self.chunk[0]) > self.lo
+    }
+}
+
+/// Read rows `first..first + count` of the first dimension of a chunked
+/// dataset through its version 1 B-tree (node type 1), scattering the chunks
+/// that hold them into a row-major buffer; chunks holding none of them are
+/// neither read nor unfiltered. The whole dataset is `first = 0`, `count` =
+/// its first extent.
 ///
-/// Chunks pass through the filters the object's pipeline message declared
-/// (deflate, shuffle; nothing else is supported), the tree may have inner
-/// nodes, and the dataset may have up to four dimensions — what a
-/// `MultiSpeakerBRIR` written by netCDF4 needs (`Data.IR` is `[M][R][E][N]`,
-/// chunked, deflated and shuffled, hundreds of MB).
+/// Chunks pass through `filters`, the pipeline the object declared (deflate,
+/// shuffle; nothing else is supported), the tree may have inner nodes, and
+/// the dataset may have up to four dimensions — what a `MultiSpeakerBRIR`
+/// written by netCDF4 needs (`Data.IR` is `[M][R][E][N]`, chunked, deflated
+/// and shuffled, hundreds of MB).
 pub(crate) fn tree(
-    data_len: usize,
     data_space: DataSpace,
     data_layout: DataLayout,
+    filters: Vec<u16>,
+    first: u64,
+    count: u64,
 ) -> impl FnMut(&mut Input) -> ModalResult<Vec<u8>> {
     move |input| {
-        if data_len as u64 > MAX_DATASET_BYTES {
-            return Err(crate::hdf::helpers::invalid(
-                input,
-                "Tree data_len exceeds maximum allowed size",
-            ));
-        }
         let dims = data_space.dimensionality as usize;
         if dims == 0 || dims > data_space.dimension_size.len() || dims >= data_layout.len() {
             return Err(crate::hdf::helpers::invalid(
@@ -97,9 +117,17 @@ pub(crate) fn tree(
         for d in (0..dims.saturating_sub(1)).rev() {
             stride[d] = stride[d + 1].saturating_mul(dataset[d + 1]);
         }
-        // The pipeline message precedes the layout message in files written
-        // by the HDF5 library; a dataset without one holds raw chunks.
-        let filters = input.state.filters();
+        let hi = first
+            .checked_add(count)
+            .filter(|&hi| hi <= dataset[0])
+            .ok_or_else(|| crate::hdf::helpers::invalid(input, "Tree rows beyond the dataset"))?;
+        let data_len = count
+            .checked_mul(stride[0])
+            .and_then(|e| e.checked_mul(size))
+            .filter(|&b| b <= MAX_DATASET_BYTES)
+            .ok_or_else(|| {
+                crate::hdf::helpers::invalid(input, "Tree data_len exceeds maximum allowed size")
+            })?;
         let geometry = Geometry {
             dims,
             chunk,
@@ -109,13 +137,15 @@ pub(crate) fn tree(
             elements,
             deflate: filters.contains(&FILTER_DEFLATE),
             shuffle: filters.contains(&FILTER_SHUFFLE),
+            lo: first,
+            hi,
         };
         info!(
-            "Tree: {} dims, chunk {:?}, dataset {:?}, element size {}, filters {:?}",
-            dims, geometry.chunk, geometry.dataset, size, filters
+            "Tree: {} dims, chunk {:?}, dataset {:?}, element size {}, filters {:?}, rows {}..{}",
+            dims, geometry.chunk, geometry.dataset, size, filters, first, hi
         );
 
-        let mut data = vec![0u8; data_len];
+        let mut data = vec![0u8; data_len as usize];
         read_node(input, &geometry, &mut data, 0)?;
         Ok(data)
     }
@@ -179,7 +209,7 @@ fn read_node(
         let _skip = take(child as usize).parse_next(input)?;
         if node_level > 0 {
             read_node(input, geometry, data, depth + 1)?;
-        } else {
+        } else if geometry.holds_rows(&start) {
             info!(" chunk at {child:#x} len {chunk_bytes} start {start:?}");
             read_chunk(input, geometry, data, chunk_bytes as usize, &start)?;
         }
@@ -191,8 +221,9 @@ fn read_node(
 }
 
 /// One chunk at the current position: unfilter it and scatter its elements
-/// into `data` at `start`, dropping whatever lies beyond the dataset (the
-/// edge chunks of a dataset whose extent is not a multiple of the chunk).
+/// into `data` at `start`, dropping whatever lies outside the rows read or
+/// beyond the dataset (the edge chunks of a dataset whose extent is not a
+/// multiple of the chunk).
 fn read_chunk(
     input: &mut Input,
     g: &Geometry,
@@ -220,33 +251,42 @@ fn read_chunk(
     let last = g.dims - 1;
     let run_len = g.chunk[last];
     let runs = g.elements / run_len;
-    // Elements of the innermost dimension that fall inside the dataset.
-    let keep = g.dataset[last].saturating_sub(start[last]).min(run_len);
+    // Elements of the innermost dimension, within a run, that fall inside
+    // what is read: `begin..end`.
+    let (lo_last, hi_last) = g.window(last);
+    let begin = lo_last.saturating_sub(start[last]).min(run_len);
+    let end = hi_last.saturating_sub(start[last]).min(run_len);
     let size = g.size as usize;
     let elements = g.elements as usize;
     for run in 0..runs {
-        // Multi-index of the run over the outer dimensions, row-major.
+        // Multi-index of the run over the outer dimensions, row-major, as
+        // an offset into what is read.
         let mut rem = run;
-        let mut base = start[last];
+        let mut base = 0u64;
         let mut inside = true;
         for d in (0..last).rev() {
             let local = rem % g.chunk[d];
             rem /= g.chunk[d];
-            let x = local + start[d];
-            if x >= g.dataset[d] {
+            let x = start[d].saturating_add(local);
+            let (lo, hi) = g.window(d);
+            if x < lo || x >= hi {
                 inside = false;
                 break;
             }
-            base += x * g.stride[d];
+            base = base.saturating_add((x - lo).saturating_mul(g.stride[d]));
         }
         if !inside {
             continue;
         }
         let first = (run * run_len) as usize;
-        for k in 0..keep as usize {
-            let e = first + k;
-            let dst = (base as usize + k) * size;
-            if dst + size > data.len() {
+        for k in begin..end {
+            let e = first + k as usize;
+            // `begin` puts `start[last] + k` at or past `lo_last`.
+            let at = base.saturating_add(start[last].saturating_add(k).saturating_sub(lo_last));
+            let Some(dst) = usize::try_from(at).ok().and_then(|a| a.checked_mul(size)) else {
+                break;
+            };
+            if dst.saturating_add(size) > data.len() {
                 break;
             }
             if g.shuffle {
