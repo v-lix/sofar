@@ -277,6 +277,16 @@ fn direct_block_read(
     Ok(block_data)
 }
 
+/// Whether `bits` is a valid bit field of a string datatype (HDF5 datatype
+/// message, class 3): padding type in bits 0-3 (null-terminated, null-padded
+/// or space-padded), character set in bits 4-7 (ASCII or UTF-8), bits 8-23
+/// reserved. libmysofa takes all of it for reserved and so refuses every
+/// UTF-8 attribute, which the SOFA C++ API writes (the IRCAM LISTEN sets
+/// among others).
+fn string_bit_field(bits: u64) -> bool {
+    bits & 0x0f <= 2 && (bits >> 4) & 0x0f <= 1 && bits >> 8 == 0
+}
+
 fn parse_type_3_attribute(input: &mut Input, length: usize) -> ModalResult<Attribute> {
     // Parse the magic number first
     let _magic = varint_size(5usize)
@@ -291,11 +301,14 @@ fn parse_type_3_attribute(input: &mut Input, length: usize) -> ModalResult<Attri
         .trim_matches(|c: char| c.is_whitespace() || c == '\0')
         .to_string();
 
-    // Read the second magic number
+    // The string datatype's class and version (0x13), then its bit field -
+    // see `string_bit_field`.
     let _magic2 = le_u32
-        .verify(|v| *v == 0x00000013)
+        .verify(|v| *v & 0xff == 0x13 && string_bit_field(u64::from(*v >> 8)))
         .context(StrContext::Label("FHDB type 3 magic2"))
-        .context(StrContext::Expected("0x00000013".into()))
+        .context(StrContext::Expected(
+            "0x13, padding 0-2, ASCII or UTF-8, reserved bits 0".into(),
+        ))
         .parse_next(input)?;
 
     let value_len = le_u16
@@ -407,11 +420,14 @@ fn parse_complex_attribute(input: &mut Input) -> ModalResult<Attribute> {
     // Convert to string up to the null terminator
     let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
 
-    // Read exactly 3 bytes for the reserved field (must be 0x000000 per C spec)
-    let _reserved = varint_size(3usize)
-        .verify(|v| *v == 0)
-        .context(StrContext::Label("Complex attribute reserved bytes"))
-        .context(StrContext::Expected("0x000000".into()))
+    // The string datatype's bit field; the 0x13 above is its class and
+    // version - see `string_bit_field`.
+    let _bit_field = varint_size(3usize)
+        .verify(|v| string_bit_field(*v))
+        .context(StrContext::Label("Complex attribute string bit field"))
+        .context(StrContext::Expected(
+            "padding 0-2, ASCII or UTF-8, reserved bits 0".into(),
+        ))
         .parse_next(input)?;
 
     let value_len = le_u32
